@@ -1,0 +1,518 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>seraph — live</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif}
+canvas{display:block;width:100vw;height:100vh}
+#start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.75);color:#cfd8ea;font-size:15px;letter-spacing:.25em;cursor:pointer;
+  text-transform:uppercase;user-select:none;transition:opacity .6s}
+#start.hidden{opacity:0;pointer-events:none}
+#seek{position:fixed;left:0;bottom:0;width:100%;height:26px;cursor:pointer}
+#bar{position:absolute;left:0;bottom:0;height:2px;width:0;background:rgba(210,190,150,.55);
+  pointer-events:none;transition:height .15s}
+#seek:hover #bar{height:5px;background:rgba(220,200,160,.8)}
+#hud{position:fixed;top:10px;left:12px;color:rgba(200,210,230,.5);font-size:11px;
+  letter-spacing:.1em;display:none;white-space:pre}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<div id="start">click to begin</div>
+<div id="seek"><div id="bar"></div></div>
+<div id="hud"></div>
+<script>
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 O;
+uniform vec2 uRes;
+uniform float uTime;   // seconds
+uniform float uWake;   // 0..1 wake curve
+uniform float uLid;    // 0..1 aperture openness
+uniform float uPupil;  // pupil radius factor
+uniform vec2 uGaze;    // gaze offset (yaw, pitch)
+uniform float uPulse;  // 0..1 recent-kick flash envelope
+uniform float uSpin;   // wake-integral spin phase (accelerates as it wakes)
+uniform float uDolly;  // 0..1 monotonic camera push-in
+
+#define PI 3.14159265
+#define TAU 6.2831853
+
+float h11(float p){ return fract(sin(p*127.1)*43758.5453); }
+float h21(vec2 p){ p=fract(p*vec2(234.34,435.345)); p+=dot(p,p+34.23); return fract(p.x*p.y); }
+float h31(vec3 p){ return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453); }
+float noise3(vec3 p){
+  vec3 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float n000=h31(i), n100=h31(i+vec3(1,0,0)), n010=h31(i+vec3(0,1,0)), n110=h31(i+vec3(1,1,0));
+  float n001=h31(i+vec3(0,0,1)), n101=h31(i+vec3(1,0,1)), n011=h31(i+vec3(0,1,1)), n111=h31(i+vec3(1,1,1));
+  return mix(mix(mix(n000,n100,f.x),mix(n010,n110,f.x),f.y),
+             mix(mix(n001,n101,f.x),mix(n011,n111,f.x),f.y),f.z);
+}
+float fbm(vec3 p){
+  float a=0.5, r=0.;
+  for(int i=0;i<4;i++){ r+=a*noise3(p); p=p*2.03+vec3(17.3); a*=0.5; }
+  return r;
+}
+float fbm2(vec3 p){ // cheap 2-octave variant for soft volumetric fields, fbm-normalized
+  return (0.5*noise3(p) + 0.25*noise3(p*2.03+vec3(17.3)))*1.25;
+}
+mat3 rotX(float a){ float c=cos(a),s=sin(a); return mat3(1,0,0, 0,c,-s, 0,s,c); }
+mat3 rotY(float a){ float c=cos(a),s=sin(a); return mat3(c,0,s, 0,1,0, -s,0,c); }
+mat3 rotZ(float a){ float c=cos(a),s=sin(a); return mat3(c,-s,0, s,c,0, 0,0,1); }
+
+// ============================================================ emission field
+// Everything is light. The only matter in this universe is the pupil:
+// a sphere of pure absorption.
+
+vec3 irisField(vec3 p){
+  mat3 g = rotY(uGaze.x)*rotX(uGaze.y);
+  vec3 q = g * p;
+  float r = length(q.xy);
+  float irisIn  = 0.42*uPupil;
+  float irisOut = 1.0;
+  // aperture: CURVED lid edges (arcs of big circles) close to a slit
+  float rT = 2.2;
+  float edgeT = (1.18*uLid + rT) - sqrt(max(rT*rT - q.x*q.x, 0.0));   // top lid edge y(x)
+  float edgeB = (-1.02*uLid - rT) + sqrt(max(rT*rT - q.x*q.x, 0.0));  // bottom lid edge
+  float lidMask = smoothstep(-0.02, 0.10, edgeT - q.y) * smoothstep(-0.02, 0.10, q.y - edgeB);
+  if(lidMask < 0.001) return vec3(0.0);
+  float phi = atan(q.y, q.x);
+  float depth = exp(-q.z*q.z*22.0);
+  vec3 eyeball = vec3(0.0);
+  if(r < 1.60){
+    // eyeball: limbal ring + faint sclera sheen, so the iris sits in an eye
+    float limb = exp(-pow((r-1.07)*16.0, 2.0));
+    float scl = smoothstep(1.02, 1.14, r)*(1.0-smoothstep(1.34, 1.50, r));
+    float sheen = scl*(0.30+0.22*noise3(vec3(phi*4.0, r*6.0, 3.3)));
+    eyeball = (vec3(0.72,0.82,1.0)*limb*1.5 + vec3(0.55,0.62,0.78)*sheen*0.4)
+            * depth * lidMask * mix(0.15, 1.0, uWake);
+    // eye-shell: full circle framing the eye — the orb the iris lives in.
+    // NOT lid-clipped: the shell stays even when the lids close over the iris.
+    float shell = exp(-pow((r-1.45)*26.0, 2.0));
+    eyeball += vec3(0.80,0.88,1.0) * shell
+             * (0.55+0.25*noise3(vec3(phi*6.0, 1.7, uTime*0.1)))
+             * depth * mix(0.10, 0.9, uWake);
+  }
+  float band = smoothstep(irisIn-0.06, irisIn+0.10, r) * (1.0 - smoothstep(irisOut-0.18, irisOut+0.05, r));
+  if(band < 0.001) return eyeball;
+  // radial light-fibres streaming from the pupil rim
+  float fil = fbm(vec3(phi*3.2, r*9.0 - uSpin*0.30, 2.0));
+  fil = pow(max(fil, 0.0), 2.1)*2.6;
+  float spokes = 0.6 + 0.9*pow(0.5+0.5*sin(phi*36.0 + fbm(vec3(phi*2.0, r*3.0, 7.0))*7.0), 3.0);
+  float rimGlow = exp(-pow((r-irisIn)*8.0, 2.0))*1.8;
+  float outerFade = exp(-pow((r-irisOut+0.15)*4.0, 2.0))*0.7;
+  vec3 cold = vec3(0.62, 0.78, 1.00);
+  vec3 warm = vec3(0.95, 0.85, 0.70);
+  vec3 col = mix(cold, warm, 0.25*smoothstep(0.6,1.0,r));
+  float e = (fil*spokes*band + rimGlow + outerFade*band) * depth * lidMask;
+  e *= mix(0.18, 1.35, uWake);
+  e *= 1.0 + 0.5*uPulse;
+  vec3 outCol = col * e + eyeball;
+
+  // ---- rune ring: fine dashed circle orbiting just outside the pupil ----
+  float runeR = irisIn + 0.14;
+  float runeD = abs(r - runeR);
+  float rune = smoothstep(0.30, 0.85, 0.5+0.5*sin(phi*72.0 - uSpin*1.6));
+  float runeE = exp(-runeD*runeD*2600.0) * rune * depth * lidMask;
+  outCol += vec3(0.85, 0.94, 1.0) * runeE * mix(0.25, 1.6, uWake);
+
+  // ---- luminous lid edges: glowing arcs that close over the iris ----
+  float inWin = smoothstep(1.30, 1.05, r);
+  float streak = 0.75 + 0.5*noise3(vec3(q.x*9.0, 3.0, uTime*0.15));
+  float lidT = exp(-pow((q.y-edgeT)*22.0, 2.0)) * inWin * streak;
+  float lidB = exp(-pow((q.y-edgeB)*28.0, 2.0)) * inWin * streak * 0.6;
+  // lashes: ticks rising from the top lid arc
+  float lx = fract(q.x*11.0)-0.5;
+  float lash = exp(-lx*lx*160.0) * smoothstep(0.20, 0.0, q.y-edgeT) * step(edgeT, q.y)
+             * (0.5+0.5*h11(floor(q.x*11.0)+7.0)) * inWin;
+  vec3 lidCol = mix(vec3(1.0,0.85,0.6), vec3(0.85,0.92,1.0), 0.35);
+  outCol += lidCol * (lidT*1.5 + lidB + lash*1.1) * depth * mix(0.3, 1.2, uWake);
+
+  // ---- socket: fixed arcs of dim gold framing the eye (brow + cheek) ----
+  float sockD = abs(r - 1.26);
+  float browM = smoothstep(0.05, 0.7, sin(phi));
+  float cheekM = smoothstep(0.25, 0.85, -sin(phi));
+  float sock = exp(-sockD*sockD*90.0) * (browM*1.3 + cheekM*0.6)
+             * (0.7+0.45*noise3(vec3(phi*5.0, r*4.0, 5.5)));
+  outCol += vec3(1.0, 0.72, 0.42) * sock * depth * mix(0.18, 0.9, uWake);
+
+  return outCol;
+}
+
+vec3 ringField(vec3 p, mat3 tilt, float radius, float thick, float spin,
+               float dashN, float orbN, vec3 tint, float amp){
+  vec3 q = tilt * p;
+  q = rotZ(spin) * q;
+  float ang = atan(q.y, q.x);
+  vec2 sec = vec2(length(q.xy)-radius, q.z);
+  float d2 = dot(sec, sec);
+  float core = exp(-d2/(thick*thick*0.45));
+  if(core < 0.002) return vec3(0.0);
+  // dashes of light (script-like segments)
+  float dj = h11(floor(ang*dashN/TAU)+radius*7.0);
+  float dash = smoothstep(0.35, 0.72, 0.5+0.5*sin(ang*dashN + dj*6.0));
+  dash = mix(0.12, 1.0, dash);
+  // watcher-eyes: almond rings of light with dark pupils, each on its own clock
+  float ostep = TAU/orbN;
+  float oidx = floor(ang/ostep + 0.5);
+  float oa = oidx*ostep;
+  vec2 op = vec2(cos(oa), sin(oa))*radius;
+  float os = h11(oidx*13.7 + radius);
+  float open_ = smoothstep(0.25, 0.70, 0.5+0.5*sin(uTime*(0.4+0.6*os) + os*TAU));
+  open_ = mix(0.08, 1.0, open_*mix(0.12, 1.0, uWake));
+  vec2 rel = q.xy - op;
+  float eu = dot(rel, vec2(-sin(oa), cos(oa)));
+  float ew = dot(rel, vec2(cos(oa), sin(oa))) / open_;
+  float eyeR = thick*2.6;
+  float dE = length(vec2(eu, ew));
+  float zfall = exp(-q.z*q.z/(thick*thick*2.5));
+  float iris = exp(-pow(dE - eyeR, 2.0)/(thick*thick*0.35)) * zfall;
+  float eglow = exp(-dE*dE/(eyeR*eyeR*5.0)) * zfall * 0.30;
+  float orb = (iris*2.8 + eglow) * mix(0.20, 1.0, open_) * mix(0.3, 1.0, uWake);
+  float rr = length(q.xy)-radius;
+  float lineA = exp(-pow((rr-thick*3.2), 2.0)/(thick*thick*0.16))*exp(-q.z*q.z/(thick*thick*2.0));
+  float lineB = exp(-pow((rr+thick*3.2), 2.0)/(thick*thick*0.16))*exp(-q.z*q.z/(thick*thick*2.0));
+  float e = (core*dash + orb + (lineA+lineB)*0.75) * amp * mix(0.22, 1.0, uWake) * (1.0 + 0.8*uPulse*core);
+  return tint * e;
+}
+
+vec3 wingField(vec3 p){
+  // fans of light-blades radiating below and beside the eye
+  vec3 q = p - vec3(0.0, -0.15, 0.35);
+  float ang = atan(q.x, -q.y);           // 0 straight down
+  float rad = length(q.xy);
+  if(rad < 0.9 || rad > 3.4 || abs(ang) > 2.2) return vec3(0.0);
+  float bstep = 0.105;
+  float bi = floor(ang/bstep + 0.5);
+  float ba = bi*bstep;
+  float bj = h21(vec2(bi, 3.0));
+  float ripple = sin(uTime*(0.55+0.25*bj) - abs(bi)*0.38 + bj*TAU);
+  float blen = mix(1.7, 3.1, bj) * (1.0 - 0.30*abs(ba)/2.2) * (1.0 + 0.06*ripple*uWake);
+  float across = (ang - ba)*rad;
+  float d = abs(across) - 0.012;
+  float depth = exp(-q.z*q.z*7.0);
+  float along = smoothstep(0.95, 1.35, rad) * (1.0 - smoothstep(blen*0.75, blen, rad));
+  float blade = exp(-max(d,0.0)*max(d,0.0)*900.0) * along * depth;
+  float tipglow = exp(-pow((rad-blen*0.92)*3.5, 2.0)) * along * depth * 0.8;
+  vec3 col = mix(vec3(1.0,0.82,0.55), vec3(0.85,0.9,1.0), 0.4*bj);
+  float e = (blade*(0.5+0.5*ripple*ripple) + tipglow) * mix(0.10, 0.85, uWake);
+  vec3 outW = col * e;
+  // eyes nested among the feathers — the wings are full of them
+  float ei = h21(vec2(bi, 9.0));
+  if(ei > 0.42){
+    float eR = mix(1.5, 2.4, h21(vec2(bi, 17.0)));
+    float open2 = smoothstep(0.22, 0.68, 0.5+0.5*sin(uTime*(0.35+0.5*ei) + ei*TAU));
+    open2 = mix(0.06, 1.0, open2*mix(0.08, 1.0, uWake));
+    float ea = across;
+    float eb = (rad - eR) / open2;
+    float dE2 = length(vec2(ea, eb));
+    float eyeR2 = 0.055;
+    float iris2 = exp(-pow(dE2 - eyeR2, 2.0)*2600.0) * depth;
+    float glow2 = exp(-dE2*dE2*180.0) * depth * 0.25;
+    vec3 ecol = mix(vec3(0.70,0.85,1.0), vec3(1.0,0.8,0.5), h21(vec2(bi, 23.0)));
+    outW += ecol * (iris2*2.4 + glow2) * mix(0.15, 1.0, open2) * mix(0.06, 0.95, uWake);
+  }
+  return outW;
+}
+
+float haloRing(vec3 p){
+  vec3 q = rotX(PI*0.5) * (p - vec3(0.0, 0.45, 2.2));
+  // bail before any noise unless the ray is near the torus shell
+  vec2 tb = vec2(length(q.xz)-2.7, q.y);
+  if(dot(tb,tb) > 1.1) return 0.0;
+  float flame = 0.55 + 0.9*fbm2(vec3(q.x*1.8, q.z*1.8, uTime*0.5));
+  // flame-licked rim: noise of the rim direction perturbs the radius,
+  // so the halo reads as living fire, not an airbrushed donut
+  vec2 dir = q.xz / max(length(q.xz), 1e-4);
+  float lick = fbm2(vec3(dir*2.0, uTime*0.35));
+  float rr = 2.7 + 0.55*(lick-0.5);
+  vec2 tc = vec2(length(q.xz)-rr, q.y);
+  float core = exp(-dot(tc,tc)*34.0);
+  vec2 tg = vec2(length(q.xz)-2.7, q.y);
+  float glow = exp(-dot(tg,tg)*9.0)*0.30;
+  return (core + glow)*flame;
+}
+
+vec3 fogField(vec3 p){
+  float f = fbm2(p*0.33 + vec3(uTime*0.012, uTime*0.004, 0.0));
+  float breathe = 0.85 + 0.15*sin(uTime*TAU/17.0);
+  float base = smoothstep(0.45, 0.85, f)*breathe;
+  float lowbias = 0.35 + 0.65*smoothstep(1.5, -2.5, p.y);
+  vec3 cool = vec3(0.10, 0.13, 0.22);
+  vec3 warmed = mix(cool, vec3(0.28, 0.18, 0.12), 0.4*uWake);
+  return warmed * base * lowbias * 0.16;
+}
+
+vec3 dust(vec3 p){
+  vec3 q = p*6.0 + vec3(0.0, -uTime*0.05, 0.0);
+  float n = h31(floor(q));
+  vec3 f = fract(q)-0.5;
+  float m = (n > 0.986) ? exp(-dot(f,f)*22.0) : 0.0;
+  float tw = 0.4+0.6*sin(uTime*(1.0+n*3.0)+n*40.0);
+  return vec3(0.8, 0.87, 1.0)*m*tw*0.5*mix(0.3,1.0,uWake);
+}
+
+float pupilAbsorb(vec3 p){
+  mat3 g = rotY(uGaze.x)*rotX(uGaze.y);
+  vec3 q = g * p;
+  float r = length(vec3(q.xy, q.z*1.6));
+  return smoothstep(0.42*uPupil + 0.05, 0.42*uPupil - 0.02, r);
+}
+
+vec3 render(vec2 uv){
+  float camz = -8.6 + 2.4*uDolly + 0.16*uPulse + 0.05*sin(uTime*TAU/23.0);
+  vec3 ro = vec3(0.0, 0.0, camz);
+  vec3 rd = normalize(vec3(uv, 1.55));
+
+  mat3 t0 = rotX(0.62 + 0.05*sin(uTime*TAU/43.0)) * rotZ(0.10);
+  mat3 t1 = rotX(-0.50) * rotY(0.30 + 0.04*sin(uTime*TAU/31.0+2.0));
+  mat3 t2 = rotX(1.30) * rotY(0.18);
+  // mega-wheel precession: planes tumble on the wake-integral clock —
+  // near-still while dormant, majestically turning once awake
+  mat3 mwA = rotX(1.35 + 0.22*sin(uSpin*0.021)) * rotY(0.10 + uSpin*0.009);
+  mat3 mwB = rotX(1.24 + 0.18*sin(uSpin*0.013 + 2.1)) * rotY(-uSpin*0.006);
+  // staggered reveal: the machinery assembles as it wakes
+  float wA = mix(0.15, 1.0, smoothstep(0.20, 0.45, uWake));
+  float wB = mix(0.10, 1.0, smoothstep(0.55, 0.80, uWake));
+
+  vec3 acc = vec3(0.0);
+  float T = 1.0;
+  float t = 3.2;
+  for(int i=0;i<160;i++){
+    if(t > 13.8 || T < 0.01) break;
+    float stp = 0.055 + 0.02*h21(uv+float(i)*0.13);
+    vec3 p = ro + rd*t;
+
+    vec3 e = vec3(0.0);
+    e += irisField(p);
+    e += ringField(p, t0, 2.25, 0.055, uSpin*0.10, 64.0, 14.0, vec3(1.0,0.72,0.35), 1.5);
+    e += ringField(p, t1, 1.45, 0.042, -uSpin*0.15, 48.0, 10.0, vec3(1.0,0.62,0.28), 1.3);
+    e += ringField(p, t2, 3.0, 0.05, uSpin*0.06, 80.0, 8.0, vec3(0.9,0.65,0.4), 0.8);
+    // mega-wheels: arcs too vast for the frame — the structure it lives inside
+    e += ringField(p - vec3(0.0,0.4,1.6), mwA, 5.4, 0.075, uSpin*0.026, 110.0, 22.0, vec3(0.78,0.56,0.36), 0.50*wA);
+    e += ringField(p - vec3(0.0,0.7,2.4), mwB, 7.0, 0.10, -uSpin*0.017, 140.0, 26.0, vec3(0.62,0.52,0.44), 0.36*wB);
+    e += wingField(p);
+    e += haloRing(p)*vec3(1.0,0.45,0.16)*mix(0.10, 0.85, uWake)*(1.0+0.6*uPulse);
+    e += fogField(p);
+    e += dust(p);
+
+    float absorb = pupilAbsorb(p)*8.0 + 0.02;
+    acc += T * e * stp;
+    T *= exp(-absorb*stp);
+    t += stp;
+  }
+
+  vec3 bg = mix(vec3(0.012,0.014,0.022), vec3(0.05,0.055,0.08), exp(-dot(uv,uv)*1.4));
+  // sacred-geometry mandala: subliminal structure filling the void
+  float mr = length(uv);
+  float mphi = atan(uv.y, uv.x);
+  float mrings = pow(0.5+0.5*sin(mr*34.0 - uTime*0.05), 8.0);
+  float mspokes = pow(0.5+0.5*sin(mphi*24.0 + uSpin*0.035), 10.0);
+  float mmask = smoothstep(0.35, 0.75, mr)*smoothstep(1.6, 0.9, mr);
+  bg += vec3(0.20,0.24,0.38)*(mrings*0.6 + mspokes*0.4)*mmask*0.26*mix(0.4,1.0,uWake);
+  // far mandala layer: slower, larger — depth parallax against the near one
+  vec2 uv2 = uv*0.62 - uGaze*0.10;
+  float mr2 = length(uv2);
+  float mphi2 = atan(uv2.y, uv2.x);
+  float mrings2 = pow(0.5+0.5*sin(mr2*21.0 + uTime*0.03), 8.0);
+  float mspokes2 = pow(0.5+0.5*sin(mphi2*16.0 - uSpin*0.02), 10.0);
+  float mmask2 = smoothstep(0.30, 0.70, mr2)*smoothstep(1.5, 0.85, mr2);
+  bg += vec3(0.14,0.15,0.28)*(mrings2*0.55 + mspokes2*0.45)*mmask2*0.20*mix(0.3,1.0,uWake);
+  // god-pillar: soft vertical beam behind the being
+  float pillar = exp(-uv.x*uv.x*16.0)*smoothstep(0.35, 1.1, abs(uv.y));
+  bg += vec3(1.0, 0.85, 0.6)*pillar*0.17*mix(0.15, 1.0, uWake);
+  return acc + bg*T;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes)/uRes.y;
+  vec3 col = render(uv);
+  col *= 1.15;
+  col = (col*(2.51*col+0.03))/(col*(2.43*col+0.59)+0.14);
+  float vig = 1.0 - 0.30*dot(uv,uv);
+  col *= vig;
+  col += (h21(gl_FragCoord.xy*0.7 + fract(uTime)*13.0)-0.5)*0.010;
+  col = pow(clamp(col,0.,1.), vec3(0.97, 1.0, 1.05));
+  O = vec4(col, 1.0);
+}`;
+
+const VERT = `#version 300 es
+void main(){
+  vec2 v = vec2(float((gl_VertexID&1)<<2), float((gl_VertexID&2)<<1)) - 1.0;
+  gl_Position = vec4(v*vec2(1.0,-1.0), 0.0, 1.0);
+}`;
+
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', {preserveDrawingBuffer: true});
+function sh(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
+gl.useProgram(prog);
+const U = {};
+for(const n of ['uRes','uTime','uWake','uLid','uPupil','uGaze','uPulse','uSpin','uDolly'])
+  U[n] = gl.getUniformLocation(prog, n);
+window.renderFrame = function(t, wake, lid, pupil, gazeX, gazeY, pulse, spin, dolly){
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.uniform2f(U.uRes, cv.width, cv.height);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform1f(U.uWake, wake);
+  gl.uniform1f(U.uLid, lid);
+  gl.uniform1f(U.uPupil, pupil);
+  gl.uniform2f(U.uGaze, gazeX, gazeY);
+  gl.uniform1f(U.uPulse, pulse);
+  gl.uniform1f(U.uSpin, spin);
+  gl.uniform1f(U.uDolly, dolly);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+};
+
+// ===================== driver: same deterministic state as the filmed piece =====================
+const DUR = 90;
+const SCORE = [[0,0],[8,.04],[15.5,.10],[16.4,.22],[20,.38],[24,.50],[32,.58],[42.4,.62],
+  [43.2,.70],[47.9,.72],[48.8,.78],[53.4,.79],[54.2,.85],[60.3,.86],[62.1,.91],[71.9,.92],
+  [74.9,.96],[78.1,.97],[79,1],[90,1]];
+const ONSETS = [[17.36,.385],[22.56,.364],[22.71,.371],[22.82,.427],[25.82,.36],[27.6,.416],
+  [28.27,.396],[37.9,.35],[40.7,.359],[41.57,.358],[42.82,.528],[43.09,.368],[47.63,.367],
+  [47.94,.37],[48.35,.444],[53.08,.375],[53.8,.466],[54.48,.414],[54.65,.368],[54.91,.376],
+  [57.9,.369],[60.7,.435],[61.66,.467],[65.92,.381],[68.25,.422],[68.51,.389],[68.95,.367],
+  [70.26,.361],[72.37,.45],[72.66,.366],[72.89,.395],[73.04,.413],[74.39,.46],[77.85,.387],
+  [78.52,.499],[78.89,.359],[81.32,.391]];
+const GAZE_LOCK_T = 78.5;
+
+function sampleWake(t){
+  if(t <= SCORE[0][0]) return SCORE[0][1];
+  const last = SCORE[SCORE.length-1];
+  if(t >= last[0]) return last[1];
+  for(let i=1;i<SCORE.length;i++) if(t <= SCORE[i][0]){
+    const a=SCORE[i-1], b=SCORE[i], f=(t-a[0])/(b[0]-a[0]);
+    return a[1]+(b[1]-a[1])*f;
+  }
+  return last[1];
+}
+const AREA = (() => { // cumulative integral of the wake curve at each score point
+  const a = [0];
+  for(let i=1;i<SCORE.length;i++){
+    const [t0,v0]=SCORE[i-1], [t1,v1]=SCORE[i];
+    a.push(a[i-1] + (t1-t0)*(v0+v1)/2);
+  }
+  return a;
+})();
+function wakeIntegral(t){
+  if(t <= SCORE[0][0]) return 0;
+  for(let i=1;i<SCORE.length;i++) if(t <= SCORE[i][0]){
+    const [t0,v0]=SCORE[i-1], [t1,v1]=SCORE[i];
+    const v = v0 + (v1-v0)*(t-t0)/(t1-t0);
+    return AREA[i-1] + (t-t0)*(v0+v)/2;
+  }
+  const last = SCORE[SCORE.length-1];
+  return AREA[AREA.length-1] + (t-last[0])*last[1];
+}
+const I90 = wakeIntegral(90);
+function mulberry(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function blinkEnvelope(t, wake){
+  if(wake < 0.6) return 0;
+  const w = Math.floor(t/11.5);
+  const rng = mulberry(w*7919+3);
+  const blinkT = w*11.5 + 1.5 + rng()*8.5;
+  const d = Math.abs(t-blinkT);
+  if(d > 0.28) return 0;
+  const c = 1 - d/0.28;
+  return c*c*(3-2*c);
+}
+function stateAt(t){
+  const wake = sampleWake(t);
+  let lid = 0.06 + 0.94*wake + 0.03*Math.sin(t*2*Math.PI/11);
+  lid *= 1 - 0.97*blinkEnvelope(t, wake);
+  lid = Math.max(0.02, Math.min(1, lid));
+  const pupil = 0.85 + 0.40*wake + 0.015*Math.sin(t*3.1);
+  const lockf = t > GAZE_LOCK_T ? Math.max(0, 1-(t-GAZE_LOCK_T)/0.8) : 1;
+  const amp = 0.10*(0.3+0.7*wake)*lockf;
+  const gx = amp*(Math.sin(t*2*Math.PI/13.7+1.3)+0.5*Math.sin(t*2*Math.PI/7.3));
+  const gy = amp*(Math.sin(t*2*Math.PI/17.1+4.2)+0.5*Math.sin(t*2*Math.PI/9.4+2.0));
+  let pulse = 0;
+  for(const o of ONSETS){
+    const dt = t - o[0];
+    if(dt >= 0 && dt < 0.9) pulse = Math.max(pulse, (o[1]/0.53)*Math.exp(-dt/0.16));
+  }
+  const spin = 0.3*t + 1.7*wakeIntegral(t);   // rings accelerate as it wakes
+  const dolly = wakeIntegral(t)/I90;           // monotonic 0..1 camera push
+  return [t, wake, lid, pupil, gx, gy, Math.min(pulse, 1), spin, dolly];
+}
+
+// ===================== realtime loop off the audio clock =====================
+const audio = new Audio('../audio/seraph-clip.mp3');
+audio.preload = 'auto';
+const startEl = document.getElementById('start');
+const barEl = document.getElementById('bar');
+const hudEl = document.getElementById('hud');
+let hud = false;
+
+// adaptive render scale: the raymarch cost is quadratic in resolution and the
+// piece is all glow, so upscaling from a reduced internal buffer is invisible.
+// Start from a pixel budget the GPU is known to sustain at 60fps, then adapt.
+const PX_BUDGET = 1.5e6;
+function dprCap(){ return Math.min(window.devicePixelRatio || 1, 1.25); }
+let rs = Math.min(1, Math.max(0.35, Math.sqrt(PX_BUDGET/(innerWidth*innerHeight*dprCap()*dprCap()))));
+function resize(){
+  const dpr = dprCap();
+  cv.width = Math.max(1, Math.round(innerWidth*dpr*rs));
+  cv.height = Math.max(1, Math.round(innerHeight*dpr*rs));
+}
+window.setScale = v => { rs = Math.min(1, Math.max(0.3, v)); resize(); };
+addEventListener('resize', resize);
+resize();
+
+let ema = 16.7, lastNow = 0, lastAdj = 0;
+function frame(now){
+  if(lastNow) ema += (Math.min(now - lastNow, 100) - ema)*0.08;
+  lastNow = now;
+  if(now - lastAdj > 1000){
+    lastAdj = now;
+    if(ema > 17.5 && rs > 0.35){ rs = Math.max(0.35, rs - (ema > 25 ? 0.15 : 0.07)); resize(); }
+    else if(ema < 13.5 && rs < 1.0){ rs = Math.min(1.0, rs + 0.04); resize(); }
+  }
+  const t = Math.min(audio.currentTime, DUR);
+  const st = stateAt(t);
+  window.renderFrame(...st);
+  barEl.style.width = (t/DUR*100) + '%';
+  if(hud){
+    hudEl.textContent = `t ${t.toFixed(1)}  wake ${st[1].toFixed(2)}  lid ${st[2].toFixed(2)}  pulse ${st[6].toFixed(2)}  fps ${(1000/ema).toFixed(0)}  ${cv.width}x${cv.height} (${Math.round(rs*100)}%)`;
+  }
+  requestAnimationFrame(frame);
+}
+
+startEl.addEventListener('click', () => {
+  audio.currentTime = 0;
+  audio.play();
+  startEl.classList.add('hidden');
+});
+audio.addEventListener('ended', () => {
+  startEl.textContent = 'again';
+  startEl.classList.remove('hidden');
+});
+const seekEl = document.getElementById('seek');
+let scrubbing = false;
+function seekTo(e){
+  const f = Math.min(1, Math.max(0, e.clientX / innerWidth));
+  audio.currentTime = f * DUR;
+}
+seekEl.addEventListener('pointerdown', e => { scrubbing = true; seekEl.setPointerCapture(e.pointerId); seekTo(e); });
+seekEl.addEventListener('pointermove', e => { if(scrubbing) seekTo(e); });
+seekEl.addEventListener('pointerup', () => { scrubbing = false; });
+addEventListener('keydown', e => {
+  if(e.code === 'Space'){ e.preventDefault(); audio.paused ? audio.play() : audio.pause(); }
+  if(e.key === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  if(e.key === 'h'){ hud = !hud; hudEl.style.display = hud ? 'block' : 'none'; }
+  if(e.key === 'ArrowRight') audio.currentTime = Math.min(audio.currentTime+5, DUR);
+  if(e.key === 'ArrowLeft') audio.currentTime = Math.max(audio.currentTime-5, 0);
+});
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

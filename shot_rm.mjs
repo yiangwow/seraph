@@ -1,0 +1,13 @@
+import { chromium } from 'playwright';
+const url = 'file:///home/unix/seraph/rm/rm.html';
+const browser = await chromium.launch({args: ['--use-angle=default', '--enable-unsafe-webgpu']});
+const page = await browser.newPage({viewport: {width: 1080, height: 1080}});
+page.on('pageerror', e => console.error('PAGEERROR', e.message));
+await page.goto(url);
+await page.waitForFunction('window.__ready === true', {timeout: 20000});
+const t = parseFloat(process.argv[2] ?? '65');
+const w = parseFloat(process.argv[3] ?? '0.95');
+await page.evaluate(([t, w]) => window.renderFrame(t, w, w > 0.5 ? 0.95 : 0.10, 0.9 + 0.3*w, 0.05, -0.03, 0.0), [t, w]);
+await page.locator('#c').screenshot({path: process.argv[4] ?? '/home/unix/seraph/rm/proof.png'});
+await browser.close();
+console.log('SHOT_DONE');

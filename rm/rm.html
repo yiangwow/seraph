@@ -1,0 +1,294 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>seraph — light</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<canvas id="c" width="1080" height="1080"></canvas>
+<script>
+const FRAG = `#version 300 es
+precision highp float;
+out vec4 O;
+uniform vec2 uRes;
+uniform float uTime;   // seconds
+uniform float uWake;   // 0..1 wake curve
+uniform float uLid;    // 0..1 aperture openness
+uniform float uPupil;  // pupil radius factor
+uniform vec2 uGaze;    // gaze offset (yaw, pitch)
+uniform float uPulse;  // 0..1 recent-kick flash envelope
+
+#define PI 3.14159265
+#define TAU 6.2831853
+
+float h11(float p){ return fract(sin(p*127.1)*43758.5453); }
+float h21(vec2 p){ p=fract(p*vec2(234.34,435.345)); p+=dot(p,p+34.23); return fract(p.x*p.y); }
+float h31(vec3 p){ return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453); }
+float noise3(vec3 p){
+  vec3 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float n000=h31(i), n100=h31(i+vec3(1,0,0)), n010=h31(i+vec3(0,1,0)), n110=h31(i+vec3(1,1,0));
+  float n001=h31(i+vec3(0,0,1)), n101=h31(i+vec3(1,0,1)), n011=h31(i+vec3(0,1,1)), n111=h31(i+vec3(1,1,1));
+  return mix(mix(mix(n000,n100,f.x),mix(n010,n110,f.x),f.y),
+             mix(mix(n001,n101,f.x),mix(n011,n111,f.x),f.y),f.z);
+}
+float fbm(vec3 p){
+  float a=0.5, r=0.;
+  for(int i=0;i<4;i++){ r+=a*noise3(p); p=p*2.03+vec3(17.3); a*=0.5; }
+  return r;
+}
+mat3 rotX(float a){ float c=cos(a),s=sin(a); return mat3(1,0,0, 0,c,-s, 0,s,c); }
+mat3 rotY(float a){ float c=cos(a),s=sin(a); return mat3(c,0,s, 0,1,0, -s,0,c); }
+mat3 rotZ(float a){ float c=cos(a),s=sin(a); return mat3(c,-s,0, s,c,0, 0,0,1); }
+
+// ============================================================ emission field
+// Everything is light. The only matter in this universe is the pupil:
+// a sphere of pure absorption.
+
+vec3 irisField(vec3 p){
+  mat3 g = rotY(uGaze.x)*rotX(uGaze.y);
+  vec3 q = g * p;
+  float r = length(q.xy);
+  float irisIn  = 0.42*uPupil;
+  float irisOut = 1.0;
+  // aperture: CURVED lid edges (arcs of big circles) close to a slit
+  float rT = 2.2;
+  float edgeT = (1.18*uLid + rT) - sqrt(max(rT*rT - q.x*q.x, 0.0));   // top lid edge y(x)
+  float edgeB = (-1.02*uLid - rT) + sqrt(max(rT*rT - q.x*q.x, 0.0));  // bottom lid edge
+  float lidMask = smoothstep(-0.02, 0.10, edgeT - q.y) * smoothstep(-0.02, 0.10, q.y - edgeB);
+  if(lidMask < 0.001) return vec3(0.0);
+  float phi = atan(q.y, q.x);
+  float band = smoothstep(irisIn-0.06, irisIn+0.10, r) * (1.0 - smoothstep(irisOut-0.18, irisOut+0.05, r));
+  if(band < 0.001) return vec3(0.0);
+  float depth = exp(-q.z*q.z*22.0);
+  // radial light-fibres streaming from the pupil rim
+  float fil = fbm(vec3(phi*3.2, r*9.0 - uTime*0.14, 2.0));
+  fil = pow(max(fil, 0.0), 2.1)*2.6;
+  float spokes = 0.6 + 0.9*pow(0.5+0.5*sin(phi*36.0 + fbm(vec3(phi*2.0, r*3.0, 7.0))*7.0), 3.0);
+  float rimGlow = exp(-pow((r-irisIn)*8.0, 2.0))*1.8;
+  float outerFade = exp(-pow((r-irisOut+0.15)*4.0, 2.0))*0.7;
+  vec3 cold = vec3(0.62, 0.78, 1.00);
+  vec3 warm = vec3(0.95, 0.85, 0.70);
+  vec3 col = mix(cold, warm, 0.25*smoothstep(0.6,1.0,r));
+  float e = (fil*spokes*band + rimGlow + outerFade*band) * depth * lidMask;
+  e *= mix(0.18, 1.35, uWake);
+  e *= 1.0 + 0.5*uPulse;
+  vec3 outCol = col * e;
+
+  // ---- rune ring: fine dashed circle orbiting just outside the pupil ----
+  float runeR = irisIn + 0.14;
+  float runeD = abs(r - runeR);
+  float rune = smoothstep(0.30, 0.85, 0.5+0.5*sin(phi*72.0 - uTime*0.9));
+  float runeE = exp(-runeD*runeD*2600.0) * rune * depth * lidMask;
+  outCol += vec3(0.85, 0.94, 1.0) * runeE * mix(0.25, 1.6, uWake);
+
+  // ---- luminous lid edges: glowing arcs that close over the iris ----
+  float inWin = smoothstep(1.30, 1.05, r);
+  float streak = 0.75 + 0.5*noise3(vec3(q.x*9.0, 3.0, uTime*0.15));
+  float lidT = exp(-pow((q.y-edgeT)*22.0, 2.0)) * inWin * streak;
+  float lidB = exp(-pow((q.y-edgeB)*28.0, 2.0)) * inWin * streak * 0.6;
+  // lashes: ticks rising from the top lid arc
+  float lx = fract(q.x*11.0)-0.5;
+  float lash = exp(-lx*lx*160.0) * smoothstep(0.20, 0.0, q.y-edgeT) * step(edgeT, q.y)
+             * (0.5+0.5*h11(floor(q.x*11.0)+7.0)) * inWin;
+  vec3 lidCol = mix(vec3(1.0,0.85,0.6), vec3(0.85,0.92,1.0), 0.35);
+  outCol += lidCol * (lidT*1.5 + lidB + lash*1.1) * depth * mix(0.3, 1.2, uWake);
+
+  // ---- socket: fixed arcs of dim gold framing the eye (brow + cheek) ----
+  float sockD = abs(r - 1.26);
+  float browM = smoothstep(0.05, 0.7, sin(phi));
+  float cheekM = smoothstep(0.25, 0.85, -sin(phi));
+  float sock = exp(-sockD*sockD*90.0) * (browM*1.3 + cheekM*0.6)
+             * (0.7+0.45*noise3(vec3(phi*5.0, r*4.0, 5.5)));
+  outCol += vec3(1.0, 0.72, 0.42) * sock * depth * mix(0.18, 0.9, uWake);
+
+  return outCol;
+}
+
+vec3 ringField(vec3 p, mat3 tilt, float radius, float thick, float spin,
+               float dashN, float orbN, vec3 tint, float amp){
+  vec3 q = tilt * p;
+  q = rotZ(spin) * q;
+  float ang = atan(q.y, q.x);
+  vec2 sec = vec2(length(q.xy)-radius, q.z);
+  float d2 = dot(sec, sec);
+  float core = exp(-d2/(thick*thick*0.45));
+  if(core < 0.002) return vec3(0.0);
+  // dashes of light (script-like segments)
+  float dj = h11(floor(ang*dashN/TAU)+radius*7.0);
+  float dash = smoothstep(0.35, 0.72, 0.5+0.5*sin(ang*dashN + dj*6.0));
+  dash = mix(0.12, 1.0, dash);
+  // orbs: beads that blink on their own seeded clocks
+  float ostep = TAU/orbN;
+  float oidx = floor(ang/ostep + 0.5);
+  float oa = oidx*ostep;
+  vec2 op = vec2(cos(oa), sin(oa))*radius;
+  float od = length(vec3(q.xy-op, q.z));
+  float os = h11(oidx*13.7 + radius);
+  float blink = smoothstep(0.55, 0.95, 0.5+0.5*sin(uTime*(0.5+0.7*os) + os*TAU));
+  blink = mix(0.15, 1.0, blink*mix(0.25, 1.0, uWake));
+  float orb = exp(-od*od/(thick*thick*3.2))*blink*3.0;
+  float rr = length(q.xy)-radius;
+  float lineA = exp(-pow((rr-thick*3.2), 2.0)/(thick*thick*0.16))*exp(-q.z*q.z/(thick*thick*2.0));
+  float lineB = exp(-pow((rr+thick*3.2), 2.0)/(thick*thick*0.16))*exp(-q.z*q.z/(thick*thick*2.0));
+  float e = (core*dash + orb + (lineA+lineB)*0.75) * amp * mix(0.22, 1.0, uWake) * (1.0 + 0.8*uPulse*core);
+  return tint * e;
+}
+
+vec3 wingField(vec3 p){
+  // fans of light-blades radiating below and beside the eye
+  vec3 q = p - vec3(0.0, -0.15, 0.35);
+  float ang = atan(q.x, -q.y);           // 0 straight down
+  float rad = length(q.xy);
+  if(rad < 0.9 || rad > 3.4 || abs(ang) > 2.2) return vec3(0.0);
+  float bstep = 0.105;
+  float bi = floor(ang/bstep + 0.5);
+  float ba = bi*bstep;
+  float bj = h21(vec2(bi, 3.0));
+  float ripple = sin(uTime*(0.55+0.25*bj) - abs(bi)*0.38 + bj*TAU);
+  float blen = mix(1.7, 3.1, bj) * (1.0 - 0.30*abs(ba)/2.2) * (1.0 + 0.06*ripple*uWake);
+  float across = (ang - ba)*rad;
+  float d = abs(across) - 0.012;
+  float depth = exp(-q.z*q.z*7.0);
+  float along = smoothstep(0.95, 1.35, rad) * (1.0 - smoothstep(blen*0.75, blen, rad));
+  float blade = exp(-max(d,0.0)*max(d,0.0)*900.0) * along * depth;
+  float tipglow = exp(-pow((rad-blen*0.92)*3.5, 2.0)) * along * depth * 0.8;
+  vec3 col = mix(vec3(1.0,0.82,0.55), vec3(0.85,0.9,1.0), 0.4*bj);
+  float e = (blade*(0.5+0.5*ripple*ripple) + tipglow) * mix(0.10, 0.85, uWake);
+  return col * e;
+}
+
+float haloRing(vec3 p){
+  vec3 q = rotX(PI*0.5) * (p - vec3(0.0, 0.45, 2.2));
+  vec2 t = vec2(length(q.xz)-2.7, q.y);
+  float d2 = dot(t,t);
+  float flame = 0.55 + 0.9*fbm(vec3(q.x*1.8, q.z*1.8, uTime*0.5));
+  return exp(-d2*6.0)*flame;
+}
+
+vec3 fogField(vec3 p){
+  float f = fbm(p*0.33 + vec3(uTime*0.012, uTime*0.004, 0.0));
+  float breathe = 0.85 + 0.15*sin(uTime*TAU/17.0);
+  float base = smoothstep(0.45, 0.85, f)*breathe;
+  float lowbias = 0.35 + 0.65*smoothstep(1.5, -2.5, p.y);
+  vec3 cool = vec3(0.10, 0.13, 0.22);
+  vec3 warmed = mix(cool, vec3(0.28, 0.18, 0.12), 0.4*uWake);
+  return warmed * base * lowbias * 0.16;
+}
+
+vec3 dust(vec3 p){
+  vec3 q = p*6.0 + vec3(0.0, -uTime*0.05, 0.0);
+  float n = h31(floor(q));
+  vec3 f = fract(q)-0.5;
+  float m = (n > 0.986) ? exp(-dot(f,f)*22.0) : 0.0;
+  float tw = 0.4+0.6*sin(uTime*(1.0+n*3.0)+n*40.0);
+  return vec3(0.8, 0.87, 1.0)*m*tw*0.5*mix(0.3,1.0,uWake);
+}
+
+float pupilAbsorb(vec3 p){
+  mat3 g = rotY(uGaze.x)*rotX(uGaze.y);
+  vec3 q = g * p;
+  float r = length(vec3(q.xy, q.z*1.6));
+  return smoothstep(0.42*uPupil + 0.05, 0.42*uPupil - 0.02, r);
+}
+
+vec3 render(vec2 uv){
+  vec3 ro = vec3(0.0, 0.0, -7.6);
+  vec3 rd = normalize(vec3(uv, 1.55));
+
+  mat3 t0 = rotX(0.62 + 0.05*sin(uTime*TAU/43.0)) * rotZ(0.10);
+  mat3 t1 = rotX(-0.50) * rotY(0.30 + 0.04*sin(uTime*TAU/31.0+2.0));
+  mat3 t2 = rotX(1.30) * rotY(0.18);
+
+  vec3 acc = vec3(0.0);
+  float T = 1.0;
+  float t = 3.2;
+  for(int i=0;i<160;i++){
+    if(t > 12.5 || T < 0.01) break;
+    float stp = 0.055 + 0.02*h21(uv+float(i)*0.13);
+    vec3 p = ro + rd*t;
+
+    vec3 e = vec3(0.0);
+    e += irisField(p);
+    e += ringField(p, t0, 2.25, 0.055, uTime*0.045, 64.0, 14.0, vec3(1.0,0.72,0.35), 1.5);
+    e += ringField(p, t1, 1.45, 0.042, -uTime*0.07, 48.0, 10.0, vec3(1.0,0.62,0.28), 1.3);
+    e += ringField(p, t2, 3.0, 0.05, uTime*0.028, 80.0, 8.0, vec3(0.9,0.65,0.4), 0.8);
+    e += wingField(p);
+    e += haloRing(p)*vec3(1.0,0.45,0.16)*mix(0.10, 0.85, uWake)*(1.0+0.6*uPulse);
+    e += fogField(p);
+    e += dust(p);
+
+    float absorb = pupilAbsorb(p)*8.0 + 0.02;
+    acc += T * e * stp;
+    T *= exp(-absorb*stp);
+    t += stp;
+  }
+
+  vec3 bg = mix(vec3(0.012,0.014,0.022), vec3(0.05,0.055,0.08), exp(-dot(uv,uv)*1.4));
+  // sacred-geometry mandala: subliminal structure filling the void
+  float mr = length(uv);
+  float mphi = atan(uv.y, uv.x);
+  float mrings = pow(0.5+0.5*sin(mr*34.0 - uTime*0.05), 8.0);
+  float mspokes = pow(0.5+0.5*sin(mphi*24.0 + uTime*0.02), 10.0);
+  float mmask = smoothstep(0.35, 0.75, mr)*smoothstep(1.6, 0.9, mr);
+  bg += vec3(0.20,0.24,0.38)*(mrings*0.6 + mspokes*0.4)*mmask*0.26*mix(0.4,1.0,uWake);
+  // god-pillar: soft vertical beam behind the being
+  float pillar = exp(-uv.x*uv.x*16.0)*smoothstep(0.35, 1.1, abs(uv.y));
+  bg += vec3(1.0, 0.85, 0.6)*pillar*0.17*mix(0.15, 1.0, uWake);
+  return acc + bg*T;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes)/uRes.y;
+  vec3 col = render(uv);
+  col *= 1.15;
+  col = (col*(2.51*col+0.03))/(col*(2.43*col+0.59)+0.14);
+  float vig = 1.0 - 0.30*dot(uv,uv);
+  col *= vig;
+  col += (h21(gl_FragCoord.xy*0.7 + fract(uTime)*13.0)-0.5)*0.010;
+  col = pow(clamp(col,0.,1.), vec3(0.97, 1.0, 1.05));
+  O = vec4(col, 1.0);
+}`;
+
+const VERT = `#version 300 es
+void main(){
+  vec2 v = vec2(float((gl_VertexID&1)<<2), float((gl_VertexID&2)<<1)) - 1.0;
+  gl_Position = vec4(v*vec2(1.0,-1.0), 0.0, 1.0);
+}`;
+
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', {preserveDrawingBuffer: true});
+function sh(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw gl.getProgramInfoLog(prog);
+gl.useProgram(prog);
+const U = {};
+for(const n of ['uRes','uTime','uWake','uLid','uPupil','uGaze','uPulse'])
+  U[n] = gl.getUniformLocation(prog, n);
+
+window.renderFrame = function(t, wake, lid, pupil, gazeX, gazeY, pulse){
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.uniform2f(U.uRes, cv.width, cv.height);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform1f(U.uWake, wake);
+  gl.uniform1f(U.uLid, lid);
+  gl.uniform1f(U.uPupil, pupil);
+  gl.uniform2f(U.uGaze, gazeX, gazeY);
+  gl.uniform1f(U.uPulse, pulse);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+  const px = new Uint8Array(64);
+  gl.readPixels((cv.width/2)|0, (cv.height/2)|0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  let sum = 0; for (const v of px) sum += v;
+  return {ok: !gl.isContextLost(), sum};
+};
+window.renderFrame(65.0, 0.95, 0.95, 1.15, 0.05, -0.03, 0.0);
+window.__ready = true;
+</script>
+</body>
+</html>

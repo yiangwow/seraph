@@ -1,0 +1,10 @@
+node_modules/
+dist/
+audio/
+shots/
+blender/renders/
+__pycache__/
+rm/frames/
+rm/frames_gpu/
+rm/strip/
+rm/*.log
